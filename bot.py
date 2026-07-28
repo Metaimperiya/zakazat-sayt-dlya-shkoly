@@ -184,33 +184,33 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 dp.update.outer_middleware(UserTrackingMiddleware())
 
-# ==================== ДАННЫЕ УСЛУГ ====================
+# ==================== ДАННЫЕ УСЛУГ (В ДОЛЛАРАХ) ====================
 SERVICES = {
     "album": {
         "emoji": "🎓",
         "name": "Выпускной альбом / Класс",
-        "price": "от 3 000 грн / 8 000 руб.",
+        "price": "от $80",
         "description": "• Живые фото и видео\n• Персональная страница каждого ученика\n• Онлайн-таймер до выпускного",
         "photo": "https://images.unsplash.com/photo-1523240795612-9a054b0db644?auto=format&fit=crop&w=800&q=80",
     },
     "primary": {
         "emoji": "🎒",
         "name": "Сайт для 1-4 классов",
-        "price": "от 2 500 грн / 6 500 руб.",
+        "price": "от $65",
         "description": "• Расписание уроков и объявлений\n• Фотоотчеты с мероприятий и экскурсий\n• Удобный доступ для родителей",
         "photo": "https://images.unsplash.com/photo-1509062522246-3755977927d7?auto=format&fit=crop&w=800&q=80",
     },
     "school": {
         "emoji": "🏫",
         "name": "Официальный сайт школы",
-        "price": "от 8 000 грн / 20 000 руб.",
+        "price": "от $220",
         "description": "• Полное соответствие стандартам\n• Разделы: Документы, Педсостав, Новости\n• Высокая защита и быстродействие",
         "photo": "https://images.unsplash.com/photo-1580582932707-520aed937b7b?auto=format&fit=crop&w=800&q=80",
     },
     "portfolio": {
         "emoji": "🏆",
         "name": "Портфолио ученика / Учителя",
-        "price": "от 1 500 грн / 4 000 руб.",
+        "price": "от $40",
         "description": "• Для аттестации учителя или поступления ученика\n• Галерея грамот, проектов и достижений\n• Презентабельный вид на любых устройствах",
         "photo": "https://images.unsplash.com/photo-1434030216411-0b793f4b4173?auto=format&fit=crop&w=800&q=80",
     }
@@ -349,7 +349,6 @@ async def process_buttons(message: Message, state: FSMContext):
             btn_text = parts[0].strip()
             btn_url = parts[1].strip()
             
-            # Проверяем URL
             if btn_url.startswith(("http://", "https://", "tg://")):
                 buttons.append([InlineKeyboardButton(text=btn_text, url=btn_url)])
                 logger.info(f"✅ Кнопка: {btn_text} -> {btn_url}")
@@ -417,7 +416,6 @@ async def publish_post(callback: CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     
     try:
-        # Публикуем в канал
         if photo:
             await bot.send_photo(
                 chat_id=CHANNEL_ID,
@@ -432,14 +430,12 @@ async def publish_post(callback: CallbackQuery, state: FSMContext):
                 reply_markup=keyboard
             )
         
-        # Сохраняем в БД
         await db.save_post(
             admin_id=callback.from_user.id,
             text=text,
             photo_id=photo
         )
         
-        # Отправляем уведомление в группу
         await bot.send_message(
             chat_id=GROUP_ID,
             text=f"📢 <b>Новый пост в канале!</b>\n\n{text[:200]}{'...' if len(text) > 200 else ''}",
@@ -490,6 +486,7 @@ async def start_cmd(message: Message, state: FSMContext):
         f"👋 <b>Салам, {message.from_user.first_name}!</b>\n\n"
         "Добро пожаловать в <b>MetaImperiya</b>! 🚀\n"
         "Мы создаем современные веб-сайты и цифровые продукты для образования.\n\n"
+        "💰 <b>Все цены указаны в USD</b>\n\n"
         "📌 Выберите интересующую услугу в меню ниже:"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard())
@@ -560,7 +557,6 @@ async def finish_order(message: Message, state: FSMContext):
     """Завершение оформления заявки"""
     data = await state.get_data()
     
-    # Сохраняем в БД
     try:
         order_id = await db.save_order(
             telegram_id=message.from_user.id,
@@ -577,7 +573,6 @@ async def finish_order(message: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Формируем сообщение для группы
     order_text = (
         "🚀 <b>НОВАЯ ЗАЯВКА!</b>\n"
         f"🆔 <b>№:</b> {order_id}\n"
@@ -590,7 +585,6 @@ async def finish_order(message: Message, state: FSMContext):
         f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>"
     )
     
-    # Отправляем в группу
     try:
         await bot.send_message(
             chat_id=GROUP_ID,
@@ -600,7 +594,6 @@ async def finish_order(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки в группу: {e}")
     
-    # Отправляем админам в личку
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -610,7 +603,6 @@ async def finish_order(message: Message, state: FSMContext):
         except Exception as e:
             logger.error(f"❌ Ошибка отправки админу {admin_id}: {e}")
     
-    # Ответ пользователю
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Перейти на сайт", url=SITE_URL)],
         [InlineKeyboardButton(text="📱 Наш канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
@@ -644,7 +636,7 @@ async def show_service_card(message: Message):
     caption = (
         f"{service['emoji']} <b>{service['name']}</b>\n\n"
         f"{service['description']}\n\n"
-        f"💰 <b>Цена:</b> {service['price']}"
+        f"💰 <b>Цена:</b> {service['price']} USD"
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -675,7 +667,8 @@ async def order_from_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(OrderStates.name)
     
     await callback.message.answer(
-        f"✅ Вы выбрали: <b>{service['name']}</b>\n\n"
+        f"✅ Вы выбрали: <b>{service['name']}</b>\n"
+        f"💰 Цена: {service['price']} USD\n\n"
         "Теперь укажите ваше имя:",
         reply_markup=get_cancel_keyboard()
     )
@@ -712,7 +705,8 @@ async def admin_panel(message: Message):
     await message.answer(
         "🛠 <b>Админ-панель</b>\n\n"
         f"📢 Канал: {CHANNEL_ID}\n"
-        f"💬 Группа: {GROUP_ID}\n\n"
+        f"💬 Группа: {GROUP_ID}\n"
+        f"💰 Валюта: USD\n\n"
         "Выберите действие:",
         reply_markup=keyboard
     )
@@ -731,11 +725,11 @@ async def admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     
-    # Здесь можно добавить реальную статистику из БД
     await callback.message.answer(
         "📊 <b>Статистика</b>\n\n"
         "👥 Пользователей: данные из БД\n"
-        "📝 Заявок: данные из БД"
+        "📝 Заявок: данные из БД\n"
+        "💰 Валюта: USD"
     )
 
 @dp.callback_query(F.data == "admin_orders")
@@ -746,7 +740,6 @@ async def admin_orders(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     
-    # Здесь можно получить заявки из БД
     await callback.message.answer(
         "📋 <b>Последние заявки</b>\n\n"
         "Данные будут загружены из БД..."
@@ -784,7 +777,8 @@ class WebServer:
             "status": "ok",
             "timestamp": datetime.now().isoformat(),
             "channel": CHANNEL_ID,
-            "group": GROUP_ID
+            "group": GROUP_ID,
+            "currency": "USD"
         })
 
     async def start(self):
@@ -808,6 +802,7 @@ async def main():
         logger.info("🚀 Запуск бота...")
         logger.info(f"📢 Канал: {CHANNEL_ID}")
         logger.info(f"💬 Группа: {GROUP_ID}")
+        logger.info("💰 Валюта: USD")
         
         await db.connect()
         await web_server.start()
