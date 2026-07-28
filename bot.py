@@ -1,9 +1,9 @@
 import asyncio
 import os
 import logging
+import signal
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-from contextlib import asynccontextmanager
+from typing import Dict, List, Optional, Any, Union
 
 import aiosqlite
 from aiohttp import web
@@ -12,20 +12,20 @@ from aiogram.types import (
     Message, 
     ReplyKeyboardMarkup, 
     KeyboardButton, 
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    WebAppInfo,
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    CallbackQuery, 
+    WebAppInfo, 
     TelegramObject
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
 
 # ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -37,180 +37,224 @@ logger = logging.getLogger(__name__)
 # ==================== ПРОВЕРКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====================
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError(
-        "❌ Переменная окружения BOT_TOKEN не установлена! "
-        "Проверьте файл .env или настройки хостинга."
-    )
+    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
 
-ADMIN_ID = os.getenv("ADMIN_ID")
-if not ADMIN_ID:
-    logger.warning("⚠️ ADMIN_ID не установлен. Админ-команды будут недоступны.")
+# Парсинг ADMIN_ID с поддержкой как цифровых ID, так и @username каналов/чатов
+ADMIN_IDS: List[Union[int, str]] = []
+raw_admin_ids = os.getenv("ADMIN_ID", "")
+
+if raw_admin_ids:
+    for part in raw_admin_ids.split(","):
+        part = part.strip()
+        if part.startswith("@"):
+            # Если указан логин канала/чата (например, @METAIMPERIYA)
+            ADMIN_IDS.append(part)
+            logger.info(f"📢 Добавлен получатель по логину: {part}")
+        elif part.isdigit() or (part.startswith("-") and part[1:].isdigit()):
+            # Если указан числовой ID (для личных чатов или групп)
+            ADMIN_IDS.append(int(part))
+            logger.info(f"👤 Добавлен получатель по ID: {part}")
+        else:
+            logger.warning(f"⚠️ Неизвестный формат получателя: {part}")
+
+if ADMIN_IDS:
+    logger.info(f"✅ Получатели уведомлений загружены: {ADMIN_IDS}")
+else:
+    logger.warning("⚠️ ADMIN_ID не установлен. Уведомления никуда не будут отправляться.")
 
 SITE_URL = os.getenv("SITE_URL", "https://www.metaimperiya.com/")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-webapp.com")
 DB_NAME = os.getenv("DB_NAME", "bot_database.db")
+RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "0.05"))
 
-# ==================== БАЗА ДАННЫХ (АСИНХРОННАЯ) ====================
+# ==================== БАЗА ДАННЫХ С ПУЛОМ СОЕДИНЕНИЙ ====================
 class Database:
-    """Асинхронный класс для работы с SQLite через aiosqlite"""
+    """Асинхронный класс для работы с SQLite с пулом соединений"""
     
-    def __init__(self, db_name: str = DB_NAME):
+    def __init__(self, db_name: str = DB_NAME, pool_size: int = 3):
         self.db_name = db_name
-    
-    async def init_db(self):
-        """Инициализация таблиц базы данных"""
-        async with aiosqlite.connect(self.db_name) as conn:
-            # Включаем поддержку внешних ключей
-            await conn.execute("PRAGMA foreign_keys = ON")
+        self.pool_size = pool_size
+        self._pool: List[aiosqlite.Connection] = []
+        self._lock = asyncio.Lock()
+        self._is_connected = False
+
+    async def connect(self):
+        """Создание пула соединений"""
+        async with self._lock:
+            if self._is_connected:
+                return
             
-            # Таблица пользователей
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    telegram_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            for i in range(self.pool_size):
+                conn = await aiosqlite.connect(self.db_name)
+                conn.row_factory = aiosqlite.Row
+                
+                await conn.execute("PRAGMA journal_mode = WAL;")
+                await conn.execute("PRAGMA busy_timeout = 10000;")
+                await conn.execute("PRAGMA foreign_keys = ON;")
+                await conn.execute("PRAGMA cache_size = -10000;")
+                await conn.execute("PRAGMA synchronous = NORMAL;")
+                
+                self._pool.append(conn)
             
-            # Таблица заявок
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER,
-                    name TEXT,
-                    service TEXT,
-                    contact TEXT,
-                    comment TEXT,
-                    username TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'new',
-                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-                )
-            """)
-            
-            # Индексы для оптимизации
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_orders_created_at 
-                ON orders(created_at DESC)
-            """)
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_orders_status 
-                ON orders(status)
-            """)
-            
-            await conn.commit()
-            logger.info("✅ База данных инициализирована")
-    
-    async def save_user(
-        self,
-        telegram_id: int,
-        username: str,
-        first_name: str,
-        last_name: str = "",
-    ):
-        """Сохранение или обновление данных пользователя"""
-        async with aiosqlite.connect(self.db_name) as conn:
+            await self._init_db()
+            self._is_connected = True
+            logger.info(f"✅ База данных подключена (пул: {self.pool_size} соединений)")
+
+    @asynccontextmanager
+    async def get_connection(self):
+        """Получение соединения из пула"""
+        if not self._pool:
+            await self.connect()
+        
+        conn = self._pool.pop(0)
+        try:
+            yield conn
+        finally:
+            self._pool.append(conn)
+
+    async def close(self):
+        """Закрытие всех соединений"""
+        async with self._lock:
+            for conn in self._pool:
+                try:
+                    await conn.close()
+                except Exception as e:
+                    logger.error(f"Ошибка закрытия соединения: {e}")
+            self._pool.clear()
+            self._is_connected = False
+            logger.info("✅ Все соединения с БД закрыты")
+
+    async def _init_db(self):
+        """Инициализация таблиц"""
+        async with self.get_connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        telegram_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telegram_id INTEGER,
+                        name TEXT,
+                        service TEXT,
+                        contact TEXT,
+                        comment TEXT,
+                        username TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'new'
+                    )
+                """)
+                
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+                
+                await conn.commit()
+                logger.info("✅ Таблицы базы данных созданы/обновлены")
+
+    async def save_user(self, telegram_id: int, username: str, first_name: str, last_name: str = ""):
+        """Сохранение пользователя"""
+        async with self.get_connection() as conn:
             await conn.execute(
                 """
-                INSERT OR REPLACE INTO users 
-                (telegram_id, username, first_name, last_name, last_active)
+                INSERT INTO users (telegram_id, username, first_name, last_name, last_active)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    last_active = CURRENT_TIMESTAMP
                 """,
                 (telegram_id, username[:50], first_name[:50], last_name[:50]),
             )
             await conn.commit()
-    
-    async def save_order(
-        self,
-        telegram_id: int,
-        name: str,
-        service: str,
-        contact: str,
-        comment: str,
-        username: str,
-    ) -> int:
-        """Сохранение новой заявки"""
-        async with aiosqlite.connect(self.db_name) as conn:
+
+    async def save_order(self, telegram_id: int, name: str, service: str, 
+                         contact: str, comment: str, username: str) -> int:
+        """Сохранение заявки"""
+        async with self.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                INSERT INTO orders 
-                (telegram_id, name, service, contact, comment, username)
+                INSERT INTO orders (telegram_id, name, service, contact, comment, username)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (telegram_id, name[:100], service[:200], contact[:200], comment[:500], username[:50]),
             )
             await conn.commit()
             return cursor.lastrowid
-    
+
+    async def get_all_user_ids(self) -> List[int]:
+        """Получение всех пользователей для рассылки"""
+        async with self.get_connection() as conn:
+            async with conn.execute("SELECT telegram_id FROM users") as cursor:
+                rows = await cursor.fetchall()
+                return [row["telegram_id"] for row in rows]
+
     async def get_stats(self) -> Dict[str, int]:
         """Получение статистики"""
-        async with aiosqlite.connect(self.db_name) as conn:
-            # Общее количество пользователей
-            async with conn.execute("SELECT COUNT(*) FROM users") as cursor:
-                total_users = (await cursor.fetchone())[0]
+        async with self.get_connection() as conn:
+            async with conn.execute("SELECT COUNT(*) FROM users") as c:
+                total_users = (await c.fetchone())[0]
             
-            # Заявок за сегодня
-            async with conn.execute("""
-                SELECT COUNT(*) FROM orders 
-                WHERE DATE(created_at) = DATE('now', 'localtime')
-            """) as cursor:
-                today_orders = (await cursor.fetchone())[0]
+            async with conn.execute(
+                "SELECT COUNT(*) FROM orders WHERE DATE(created_at) = DATE('now', 'localtime')"
+            ) as c:
+                today_orders = (await c.fetchone())[0]
             
-            # Всего заявок
-            async with conn.execute("SELECT COUNT(*) FROM orders") as cursor:
-                total_orders = (await cursor.fetchone())[0]
+            async with conn.execute("SELECT COUNT(*) FROM orders") as c:
+                total_orders = (await c.fetchone())[0]
             
-            # Новых заявок
-            async with conn.execute("""
-                SELECT COUNT(*) FROM orders 
-                WHERE status = 'new'
-            """) as cursor:
-                new_orders = (await cursor.fetchone())[0]
-            
-            return {
-                "total_users": total_users,
-                "today_orders": today_orders,
-                "total_orders": total_orders,
-                "new_orders": new_orders,
-            }
-    
+            async with conn.execute("SELECT COUNT(*) FROM orders WHERE status = 'new'") as c:
+                new_orders = (await c.fetchone())[0]
+
+        return {
+            "total_users": total_users,
+            "today_orders": today_orders,
+            "total_orders": total_orders,
+            "new_orders": new_orders,
+        }
+
     async def get_recent_orders(self, limit: int = 5) -> List[Dict[str, Any]]:
         """Получение последних заявок"""
-        async with aiosqlite.connect(self.db_name) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with self.get_connection() as conn:
             async with conn.execute(
                 """
-                SELECT id, name, service, contact, username, created_at, status
-                FROM orders
-                ORDER BY created_at DESC
+                SELECT id, name, service, contact, username, created_at, status 
+                FROM orders 
+                ORDER BY created_at DESC 
                 LIMIT ?
                 """,
-                (limit,),
+                (limit,)
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
-    
+
     async def update_order_status(self, order_id: int, status: str):
         """Обновление статуса заявки"""
-        async with aiosqlite.connect(self.db_name) as conn:
+        async with self.get_connection() as conn:
             await conn.execute(
-                "UPDATE orders SET status = ? WHERE id = ?",
+                "UPDATE orders SET status = ? WHERE id = ?", 
                 (status, order_id)
             )
             await conn.commit()
 
 db = Database()
 
-# ==================== MIDDLEWARE ДЛЯ ОТСЛЕЖИВАНИЯ ПОЛЬЗОВАТЕЛЕЙ ====================
+# ==================== MIDDLEWARE ====================
 class UserTrackingMiddleware(BaseMiddleware):
-    """Middleware для автоматического сохранения пользователей"""
+    """Middleware для отслеживания пользователей"""
     
     async def __call__(self, handler, event: TelegramObject, data: dict):
         user = getattr(event, "from_user", None)
-        if user:
+        if user and not user.is_bot:
             try:
                 await db.save_user(
                     telegram_id=user.id,
@@ -220,7 +264,6 @@ class UserTrackingMiddleware(BaseMiddleware):
                 )
             except Exception as e:
                 logger.error(f"Ошибка сохранения пользователя {user.id}: {e}")
-        
         return await handler(event, data)
 
 # ==================== ИНИЦИАЛИЗАЦИЯ БОТА ====================
@@ -229,8 +272,6 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher(storage=MemoryStorage())
-
-# Регистрируем middleware
 dp.update.outer_middleware(UserTrackingMiddleware())
 
 # ==================== ДАННЫЕ УСЛУГ ====================
@@ -307,25 +348,79 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
-@dp.message(CommandStart())
-async def start_cmd(message: Message):
-    """Обработчик команды /start"""
-    welcome_text = (
-        "👋 <b>Салам, {first_name}!</b>\n\n"
-        "Добро пожаловать в <b>MetaImperiya</b>! 🚀\n"
-        "Мы создаем современные веб-сайты и цифровые продукты для образования.\n\n"
-        "📌 Выберите интересующую услугу в меню ниже или воспользуйтесь кнопками:"
-    ).format(first_name=message.from_user.first_name)
+# ==================== ФУНКЦИЯ ОТПРАВКИ УВЕДОМЛЕНИЙ ====================
+async def send_notification_to_admins(order_text: str, order_id: int):
+    """
+    Отправка уведомления о новой заявке всем админам
+    Поддерживает как личные ID, так и @username каналов/чатов
+    """
+    if not ADMIN_IDS:
+        logger.warning("⚠️ Нет получателей для уведомления")
+        return
+
+    sent_count = 0
+    error_count = 0
+
+    for admin in ADMIN_IDS:
+        try:
+            if isinstance(admin, str) and admin.startswith("@"):
+                # Отправка в канал/чат по логину
+                # Для каналов нужно использовать chat_id в формате @username
+                try:
+                    await bot.send_message(
+                        chat_id=admin,  # @METAIMPERIYA
+                        text=order_text,
+                        parse_mode=ParseMode.HTML
+                    )
+                    sent_count += 1
+                    logger.info(f"📨 Уведомление отправлено в канал/чат {admin}")
+                except TelegramForbiddenError:
+                    logger.error(f"❌ Бот не является администратором канала {admin}! Добавьте бота в администраторы.")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки в канал {admin}: {e}")
+                    error_count += 1
+            else:
+                # Отправка в личный чат по ID
+                await bot.send_message(
+                    chat_id=int(admin),
+                    text=order_text,
+                    parse_mode=ParseMode.HTML
+                )
+                sent_count += 1
+                logger.info(f"📨 Уведомление отправлено админу {admin}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки получателю {admin}: {e}")
+            error_count += 1
     
+    return sent_count, error_count
+
+# ==================== ГЛОБАЛЬНАЯ ОТМЕНА FSM ====================
+@dp.message(F.text == "❌ Отменить заявку", StateFilter("*"))
+async def cancel_order(message: Message, state: FSMContext):
+    """Глобальная отмена заявки из любого состояния"""
+    await state.clear()
     await message.answer(
-        welcome_text,
+        "❌ Заявка отменена. Если передумаете — мы всегда на связи!",
         reply_markup=get_main_keyboard()
     )
 
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+@dp.message(CommandStart())
+async def start_cmd(message: Message, state: FSMContext):
+    """Стартовая команда"""
+    await state.clear()
+    welcome_text = (
+        f"👋 <b>Салам, {message.from_user.first_name}!</b>\n\n"
+        "Добро пожаловать в <b>MetaImperiya</b>! 🚀\n"
+        "Мы создаем современные веб-сайты и цифровые продукты для образования.\n\n"
+        "📌 Выберите интересующую услугу в меню ниже:"
+    )
+    await message.answer(welcome_text, reply_markup=get_main_keyboard())
+
 @dp.message(Command("help"))
+@dp.message(F.text == "❓ Помощь")
 async def help_cmd(message: Message):
-    """Обработчик команды /help"""
+    """Помощь"""
     help_text = (
         "❓ <b>Помощь по боту</b>\n\n"
         "📌 <b>Доступные команды:</b>\n"
@@ -343,11 +438,10 @@ async def help_cmd(message: Message):
 
 @dp.message(Command("services"))
 async def services_cmd(message: Message):
-    """Список всех услуг"""
+    """Список услуг"""
     text = "📋 <b>Наши услуги:</b>\n\n"
-    for key, service in SERVICES.items():
-        text += f"{service['emoji']} <b>{service['name']}</b>\n   💰 {service['price']}\n\n"
-    
+    for service in SERVICES.values():
+        text += f"{service['emoji']} <b>{service['name']}</b>\n💰 {service['price']}\n\n"
     await message.answer(text, reply_markup=get_main_keyboard())
 
 @dp.message(Command("contacts"))
@@ -357,39 +451,20 @@ async def contacts_cmd(message: Message):
         "📱 <b>Наши контакты:</b>\n\n"
         "🌐 Сайт: metaimperiya.com\n"
         "📧 Email: info@metaimperiya.com\n"
-        "📞 Телефон: +380 XX XXX XXXX\n"
         "💬 Telegram: @metaimperiya_support\n\n"
         "🕐 Работаем: Пн-Пт 9:00-20:00"
     )
     await message.answer(contacts_text, reply_markup=get_main_keyboard())
 
-# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+# ==================== КНОПКИ ГЛАВНОГО МЕНЮ ====================
 @dp.message(F.text == "📱 Наш сайт")
 async def open_site(message: Message):
-    """Кнопка перехода на сайт"""
+    """Переход на сайт"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Открыть MetaImperiya.com", url=SITE_URL)],
         [InlineKeyboardButton(text="📱 Открыть в Web App", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await message.answer(
-        "🌐 Наши проекты, портфолио и свежие релизы ждут вас на сайте!",
-        reply_markup=keyboard
-    )
-
-@dp.message(F.text == "📞 Заявка")
-async def start_order(message: Message, state: FSMContext):
-    """Начать оформление заявки"""
-    await state.set_state(OrderForm.service)
-    await message.answer(
-        "📝 <b>Оформление заявки</b>\n\n"
-        "Напишите, какой проект вас интересует, или выберите из списка услуг выше.",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@dp.message(F.text == "❓ Помощь")
-async def show_help(message: Message):
-    """Кнопка помощи"""
-    await help_cmd(message)
+    await message.answer("🌐 Наши проекты и портфолио ждут вас на сайте!", reply_markup=keyboard)
 
 @dp.message(F.text == "💼 Вакансии")
 async def vacancies(message: Message):
@@ -399,94 +474,25 @@ async def vacancies(message: Message):
         "Открыты вакансии:\n"
         "• Frontend-разработчик (React/Vue)\n"
         "• Backend-разработчик (Python/Django)\n"
-        "• UI/UX Дизайнер\n"
-        "• Менеджер по продажам\n\n"
+        "• UI/UX Дизайнер\n\n"
         "Присылайте резюме: career@metaimperiya.com"
     )
     await message.answer(vacancies_text, reply_markup=get_main_keyboard())
 
-@dp.message(F.text == "❌ Отменить заявку")
-async def cancel_order(message: Message, state: FSMContext):
-    """Отмена заявки"""
-    await state.clear()
+@dp.message(F.text == "📞 Заявка")
+async def start_order(message: Message, state: FSMContext):
+    """Начало оформления заявки"""
+    await state.set_state(OrderForm.service)
     await message.answer(
-        "❌ Заявка отменена. Если передумаете - мы всегда на связи!",
-        reply_markup=get_main_keyboard()
-    )
-
-# ==================== ОБРАБОТЧИКИ УСЛУГ ====================
-@dp.message(F.text.in_([f"{data['emoji']} {data['name']}" for data in SERVICES.values()]))
-async def show_service_card(message: Message):
-    """Показать карточку услуги"""
-    service_key = None
-    for key, data in SERVICES.items():
-        if f"{data['emoji']} {data['name']}" == message.text:
-            service_key = key
-            break
-    
-    if not service_key:
-        return
-    
-    service = SERVICES[service_key]
-    
-    caption = (
-        f"{service['emoji']} <b>{service['name']}</b>\n\n"
-        f"{service['description']}\n\n"
-        f"💰 <b>Цена:</b> {service['price']}"
-    )
-    
-    await message.answer_photo(
-        photo=service['photo'],
-        caption=caption,
-        reply_markup=get_service_keyboard(service_key)
-    )
-
-# ==================== CALLBACK ОБРАБОТЧИКИ ====================
-@dp.callback_query(F.data.startswith("order_"))
-async def process_order_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработка заказа через callback"""
-    service_key = callback.data.replace("order_", "")
-    service = SERVICES.get(service_key)
-    
-    if not service:
-        await callback.answer("❌ Услуга не найдена", show_alert=True)
-        return
-    
-    await state.update_data(service=service['name'])
-    await state.set_state(OrderForm.name)
-    
-    # Отвечаем на callback
-    await callback.answer(f"✅ Вы выбрали: {service['name']}")
-    
-    # Отправляем новое сообщение, не удаляя карточку
-    await callback.message.answer(
-        f"✅ Вы выбрали: <b>{service['name']}</b>\n\n"
-        "Теперь укажите ваше имя:",
+        "📝 <b>Оформление заявки</b>\n\n"
+        "Напишите, какой проект вас интересует, или выберите услугу из меню ниже:",
         reply_markup=get_cancel_keyboard()
     )
-
-@dp.callback_query(F.data == "contact_manager")
-async def contact_manager(callback: CallbackQuery):
-    """Связаться с менеджером"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 Позвонить", url="tel:+380XXXXXXXXX")],
-        [InlineKeyboardButton(text="💬 Написать", url="https://t.me/metaimperiya_support")]
-    ])
-    await callback.message.answer(
-        "📞 <b>Связаться с менеджером</b>\n\n"
-        "Выберите удобный способ связи:",
-        reply_markup=keyboard
-    )
-    await callback.answer()
 
 # ==================== FSM ОБРАБОТЧИКИ ====================
 @dp.message(OrderForm.service)
 async def process_service(message: Message, state: FSMContext):
-    """Обработка выбора услуги"""
-    if message.text == "❌ Отменить заявку":
-        await cancel_order(message, state)
-        return
-    
+    """Обработка услуги"""
     await state.update_data(service=message.text)
     await state.set_state(OrderForm.name)
     await message.answer(
@@ -497,10 +503,6 @@ async def process_service(message: Message, state: FSMContext):
 @dp.message(OrderForm.name)
 async def process_name(message: Message, state: FSMContext):
     """Обработка имени"""
-    if message.text == "❌ Отменить заявку":
-        await cancel_order(message, state)
-        return
-    
     await state.update_data(name=message.text)
     await state.set_state(OrderForm.contact)
     await message.answer(
@@ -511,10 +513,6 @@ async def process_name(message: Message, state: FSMContext):
 @dp.message(OrderForm.contact)
 async def process_contact(message: Message, state: FSMContext):
     """Обработка контакта"""
-    if message.text == "❌ Отменить заявку":
-        await cancel_order(message, state)
-        return
-    
     await state.update_data(contact=message.text)
     await state.set_state(OrderForm.comment)
     await message.answer(
@@ -523,19 +521,15 @@ async def process_contact(message: Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
 
-@dp.message(Command("skip"))
+@dp.message(Command("skip"), OrderForm.comment)
 async def skip_comment(message: Message, state: FSMContext):
-    """Пропустить комментарий"""
+    """Пропуск комментария"""
     await state.update_data(comment="Нет")
     await finish_order(message, state)
 
 @dp.message(OrderForm.comment)
 async def process_comment(message: Message, state: FSMContext):
     """Обработка комментария"""
-    if message.text == "❌ Отменить заявку":
-        await cancel_order(message, state)
-        return
-    
     await state.update_data(comment=message.text)
     await finish_order(message, state)
 
@@ -543,7 +537,6 @@ async def finish_order(message: Message, state: FSMContext):
     """Завершение оформления заявки"""
     user_data = await state.get_data()
     
-    # Сохраняем в базу
     try:
         order_id = await db.save_order(
             telegram_id=message.from_user.id,
@@ -553,58 +546,120 @@ async def finish_order(message: Message, state: FSMContext):
             comment=user_data.get('comment', 'Нет'),
             username=message.from_user.username or "нет_юзернейма"
         )
-        logger.info(f"Заявка #{order_id} создана пользователем {message.from_user.id}")
+        logger.info(f"✅ Заявка #{order_id} создана")
     except Exception as e:
-        logger.error(f"Ошибка сохранения заявки: {e}")
-        await message.answer("❌ Произошла ошибка при сохранении заявки. Попробуйте позже.")
+        logger.error(f"❌ Ошибка сохранения заявки: {e}")
+        await message.answer(
+            "❌ Произошла ошибка при сохранении. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         await state.clear()
         return
-    
-    # Формируем сообщение для админа
+
+    # Формируем красивое сообщение для канала
     order_text = (
         "🚀 <b>НОВАЯ ЗАЯВКА!</b>\n"
         f"🆔 <b>№:</b> {order_id}\n"
-        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"👤 <b>Имя:</b> {user_data.get('name', 'Не указано')}\n"
-        f"🛠 <b>Услуга:</b> {user_data.get('service', 'Не указано')}\n"
-        f"📞 <b>Контакт:</b> {user_data.get('contact', 'Не указано')}\n"
-        f"💬 <b>Комментарий:</b> {user_data.get('comment', 'Нет')}\n"
-        f"🔗 <b>Юзернейм:</b> @{message.from_user.username or 'нет_юзернейма'}\n"
-        f"🆔 <b>ID:</b> {message.from_user.id}"
+        f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"👤 <b>Клиент:</b> {user_data.get('name')}\n"
+        f"🛠 <b>Услуга:</b> {user_data.get('service')}\n"
+        f"📞 <b>Контакт:</b> {user_data.get('contact')}\n"
+        f"💬 <b>Комментарий:</b> {user_data.get('comment')}\n"
+        f"🔗 <b>Юзернейм:</b> @{message.from_user.username or 'нет'}\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n\n"
+        f"📌 <i>Заявка отправлена через @MetaImperiyaBot</i>"
     )
+
+    # Отправляем уведомление в канал/чат @METAIMPERIYA и админам
+    sent_count, error_count = await send_notification_to_admins(order_text, order_id)
     
-    # Отправляем админу
-    if ADMIN_ID:
-        try:
-            await bot.send_message(chat_id=ADMIN_ID, text=order_text)
-            logger.info(f"Заявка #{order_id} отправлена админу")
-        except Exception as e:
-            logger.error(f"Ошибка отправки админу: {e}")
-    
+    if sent_count > 0:
+        logger.info(f"📨 Уведомления отправлены: {sent_count} получателям")
+    if error_count > 0:
+        logger.warning(f"⚠️ Ошибок при отправке: {error_count}")
+
     # Ответ пользователю
-    success_text = (
-        "✅ <b>Заявка принята!</b>\n\n"
-        "Мы уже обрабатываем вашу заявку и свяжемся с вами в ближайшее время.\n\n"
-        "⏱ Обычно мы отвечаем в течение 15-30 минут в рабочее время.\n\n"
-        "А пока вы можете посмотреть наши работы на сайте:"
-    )
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Перейти на MetaImperiya.com", url=SITE_URL)],
-        [InlineKeyboardButton(text="📱 Наш Instagram", url="https://instagram.com/metaimperiya")]
+        [InlineKeyboardButton(text="🌐 Перейти на MetaImperiya.com", url=SITE_URL)]
     ])
     
-    await message.answer(success_text, reply_markup=keyboard)
     await message.answer(
-        "Главное меню:",
-        reply_markup=get_main_keyboard()
+        "✅ <b>Заявка принята!</b>\n\n"
+        "Мы свяжемся с вами в ближайшее время.\n"
+        "А пока можете посмотреть наши работы на сайте:",
+        reply_markup=keyboard
     )
+    await message.answer("Главное меню:", reply_markup=get_main_keyboard())
     
     await state.clear()
 
-# ==================== АДМИН-КОМАНДЫ ====================
+# ==================== КАРТОЧКИ УСЛУГ ====================
+@dp.message(F.text.in_([f"{data['emoji']} {data['name']}" for data in SERVICES.values()]))
+async def show_service_card(message: Message):
+    """Показать карточку услуги"""
+    service_key = None
+    for key, value in SERVICES.items():
+        if f"{value['emoji']} {value['name']}" == message.text:
+            service_key = key
+            break
+    
+    if not service_key:
+        return
+
+    service = SERVICES[service_key]
+    caption = (
+        f"{service['emoji']} <b>{service['name']}</b>\n\n"
+        f"{service['description']}\n\n"
+        f"💰 <b>Цена:</b> {service['price']}"
+    )
+
+    await message.answer_photo(
+        photo=service['photo'],
+        caption=caption,
+        reply_markup=get_service_keyboard(service_key)
+    )
+
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
+@dp.callback_query(F.data.startswith("order_"))
+async def process_order_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработка заказа через callback"""
+    await callback.answer()
+    
+    service_key = callback.data.replace("order_", "")
+    service = SERVICES.get(service_key)
+    
+    if not service:
+        await callback.message.answer("❌ Услуга не найдена")
+        return
+
+    await state.update_data(service=service['name'])
+    await state.set_state(OrderForm.name)
+    
+    await callback.message.answer(
+        f"✅ Вы выбрали: <b>{service['name']}</b>\n\n"
+        "Теперь укажите ваше имя:",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@dp.callback_query(F.data == "contact_manager")
+async def contact_manager(callback: CallbackQuery):
+    """Связаться с менеджером"""
+    await callback.answer()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать", url="https://t.me/metaimperiya_support")]
+    ])
+    await callback.message.answer(
+        "📞 <b>Связаться с менеджером</b>\n\n"
+        "Наш менеджер ответит на все ваши вопросы:",
+        reply_markup=keyboard
+    )
+
+# ==================== АДМИН-ПАНЕЛЬ ====================
 def is_admin(user_id: int) -> bool:
-    return str(user_id) == ADMIN_ID
+    """Проверка, является ли пользователь администратором"""
+    # Проверяем только числовые ID (личные чаты)
+    return user_id in [uid for uid in ADMIN_IDS if isinstance(uid, int)]
 
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
@@ -612,15 +667,13 @@ async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
-    
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📨 Рассылка", callback_data="admin_mailing")],
         [InlineKeyboardButton(text="📋 Последние заявки", callback_data="admin_orders")],
-        [InlineKeyboardButton(text="✅ Обновить статус", callback_data="admin_update_status")],
-        [InlineKeyboardButton(text="⏹ Остановить бота", callback_data="admin_stop")]
+        [InlineKeyboardButton(text="📨 Рассылка", callback_data="admin_mailing")],
+        [InlineKeyboardButton(text="✅ Обновить статус", callback_data="admin_update_status")]
     ])
-    
     await message.answer(
         "🛠 <b>Админ-панель</b>\n\n"
         "Выберите действие:",
@@ -629,14 +682,14 @@ async def admin_panel(message: Message):
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
-    """Статистика бота"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
+    """Статистика"""
+    await callback.answer()
     
+    if not is_admin(callback.from_user.id):
+        return
+
     try:
         stats = await db.get_stats()
-        
         stats_text = (
             "📊 <b>Статистика бота</b>\n\n"
             f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
@@ -644,35 +697,32 @@ async def admin_stats(callback: CallbackQuery):
             f"📋 Заявок всего: <b>{stats['total_orders']}</b>\n"
             f"🆕 Новых заявок: <b>{stats['new_orders']}</b>"
         )
-        
         await callback.message.answer(stats_text)
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
         await callback.message.answer("❌ Ошибка получения статистики")
-    
-    await callback.answer()
 
 @dp.callback_query(F.data == "admin_orders")
 async def admin_orders(callback: CallbackQuery):
     """Последние заявки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
+    await callback.answer()
     
+    if not is_admin(callback.from_user.id):
+        return
+
     try:
         orders = await db.get_recent_orders(10)
         
         if not orders:
             await callback.message.answer("📭 Заявок пока нет")
-            await callback.answer()
             return
-        
+
         text = "📋 <b>Последние заявки:</b>\n\n"
         for order in orders:
             status_emoji = "🆕" if order['status'] == 'new' else "✅"
             text += (
-                f"#{order['id']} {status_emoji} | {order['name']}\n"
-                f"  📌 {order['service'][:30]}\n"
+                f"{status_emoji} #{order['id']} | <b>{order['name']}</b>\n"
+                f"  📌 {order['service'][:40]}\n"
                 f"  📞 {order['contact'][:30]}\n"
                 f"  🕐 {order['created_at'][:16]}\n"
                 "  ---\n"
@@ -682,51 +732,96 @@ async def admin_orders(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Ошибка получения заявок: {e}")
         await callback.message.answer("❌ Ошибка получения заявок")
-    
+
+@dp.callback_query(F.data == "admin_mailing")
+async def admin_mailing(callback: CallbackQuery, state: FSMContext):
+    """Начало рассылки"""
     await callback.answer()
+    
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(AdminStates.mailing)
+    await callback.message.answer(
+        "📨 <b>Рассылка</b>\n\n"
+        "Введите текст для рассылки (можно с HTML-разметкой):\n"
+        "Для отмены введите /cancel"
+    )
+
+@dp.message(AdminStates.mailing)
+async def process_mailing(message: Message, state: FSMContext):
+    """Обработка и отправка рассылки всем пользователям с rate limiting"""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Рассылка отменена", reply_markup=get_main_keyboard())
+        return
+
+    user_ids = await db.get_all_user_ids()
+    await message.answer(f"🚀 Старт рассылки на {len(user_ids)} пользователей...")
+
+    count = 0
+    blocked_count = 0
+    error_count = 0
+    
+    for i, user_id in enumerate(user_ids):
+        try:
+            await bot.send_message(chat_id=user_id, text=message.text)
+            count += 1
+            
+            if i % 30 == 29:
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(RATE_LIMIT_DELAY)
+                
+        except TelegramForbiddenError:
+            blocked_count += 1
+        except TelegramAPIError as e:
+            logger.error(f"Ошибка при отправке пользователю {user_id}: {e}")
+            error_count += 1
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при отправке {user_id}: {e}")
+            error_count += 1
+
+        if (i + 1) % 100 == 0:
+            await message.answer(
+                f"📊 Прогресс: {i + 1}/{len(user_ids)} "
+                f"(доставлено: {count}, заблокировали: {blocked_count})"
+            )
+
+    await message.answer(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"Успешно доставлено: <b>{count}</b>\n"
+        f"Заблокировали бота: <b>{blocked_count}</b>\n"
+        f"Ошибок: <b>{error_count}</b>",
+        reply_markup=get_main_keyboard()
+    )
+    await state.clear()
 
 @dp.callback_query(F.data == "admin_update_status")
 async def admin_update_status(callback: CallbackQuery):
     """Обновление статуса заявки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 В работе", callback_data="status_working")],
-        [InlineKeyboardButton(text="✅ Выполнено", callback_data="status_done")],
-        [InlineKeyboardButton(text="❌ Отклонено", callback_data="status_rejected")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
-    ])
-    
-    await callback.message.answer(
-        "📋 <b>Обновление статуса заявки</b>\n\n"
-        "Введите ID заявки, а затем выберите новый статус:",
-        reply_markup=keyboard
-    )
     await callback.answer()
+    
+    if not is_admin(callback.from_user.id):
+        return
 
-@dp.callback_query(F.data.startswith("status_"))
-async def process_status_update(callback: CallbackQuery):
-    """Обработка обновления статуса"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
-    
-    # Здесь нужно добавить логику для выбора заявки по ID
-    # Для простоты примера - заглушка
     await callback.message.answer(
-        "ℹ️ Введите ID заявки через /update_status <id>"
+        "ℹ️ Для обновления статуса заявки используйте команду:\n"
+        "/update_status <ID заявки> <статус>\n\n"
+        "Доступные статусы: working, done, rejected"
     )
-    await callback.answer()
 
 @dp.message(Command("update_status"))
 async def update_status_cmd(message: Message):
-    """Команда обновления статуса заявки"""
+    """Команда обновления статуса"""
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
-    
+
     args = message.text.split()
     if len(args) < 3:
         await message.answer(
@@ -734,10 +829,10 @@ async def update_status_cmd(message: Message):
             "Статусы: working, done, rejected"
         )
         return
-    
+
     try:
         order_id = int(args[1])
-        status = args[2]
+        status = args[2].lower()
         
         if status not in ["working", "done", "rejected"]:
             await message.answer("❌ Неверный статус. Доступны: working, done, rejected")
@@ -751,100 +846,45 @@ async def update_status_cmd(message: Message):
         logger.error(f"Ошибка обновления статуса: {e}")
         await message.answer("❌ Ошибка обновления статуса")
 
-@dp.callback_query(F.data == "admin_back")
-async def admin_back(callback: CallbackQuery):
-    """Возврат в админ-панель"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
-    
-    await admin_panel(callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_mailing")
-async def admin_mailing(callback: CallbackQuery, state: FSMContext):
-    """Начать рассылку"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
-    
-    await state.set_state(AdminStates.mailing)
-    await callback.message.answer(
-        "📨 <b>Рассылка</b>\n\n"
-        "Введите текст для рассылки (можно с HTML-разметкой):\n"
-        "Для отмены введите /cancel"
-    )
-    await callback.answer()
-
-@dp.message(AdminStates.mailing)
-async def process_mailing(message: Message, state: FSMContext):
-    """Обработка рассылки"""
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен!")
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("❌ Рассылка отменена", reply_markup=get_main_keyboard())
-        return
-    
-    # Здесь нужно получить список пользователей из БД и отправить
-    await message.answer(
-        "✅ Рассылка запущена! (В реальном боте тут будет отправка сообщений)"
-    )
-    await state.clear()
-
-@dp.callback_query(F.data == "admin_stop")
-async def admin_stop(callback: CallbackQuery):
-    """Остановка бота (корректная)"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
-    
-    await callback.answer("⏹ Бот останавливается...", show_alert=True)
-    logger.warning("⚠️ Бот остановлен админом")
-    await callback.message.answer("⏹ Бот остановлен")
-    
-    # Корректное завершение через остановку диспетчера
-    await dp.stop_polling()
-
 # ==================== ВЕБ-СЕРВЕР ====================
 class WebServer:
-    """Асинхронный веб-сервер для health check"""
+    """Веб-сервер для health check"""
     
     def __init__(self):
         self.app = web.Application()
-        self.runner = None
-        self.setup_routes()
-    
-    def setup_routes(self):
-        self.app.router.add_get("/", self.handle_ping)
-        self.app.router.add_get("/health", self.handle_health)
-        self.app.router.add_post("/webhook", self.handle_webhook)
-    
-    async def handle_ping(self, request):
+        self.runner: Optional[web.AppRunner] = None
+        self._setup_routes()
+
+    def _setup_routes(self):
+        """Настройка маршрутов"""
+        self.app.router.add_get("/", self._handle_ping)
+        self.app.router.add_get("/health", self._handle_health)
+        self.app.router.add_get("/ready", self._handle_ready)
+        self.app.router.add_get("/live", self._handle_live)
+
+    async def _handle_ping(self, request):
         """Проверка доступности"""
         return web.Response(text="OK", status=200)
-    
-    async def handle_health(self, request):
-        """Health check с детальной информацией"""
+
+    async def _handle_health(self, request):
+        """Health check с информацией"""
         return web.json_response({
             "status": "ok",
             "timestamp": datetime.now().isoformat(),
-            "bot_running": True,
-            "database": "connected"
+            "database": "connected" if db._is_connected else "disconnected",
+            "admins_count": len(ADMIN_IDS)
         })
-    
-    async def handle_webhook(self, request):
-        """Обработка webhook (опционально)"""
-        try:
-            data = await request.json()
-            logger.info(f"Webhook received: {data}")
-            return web.json_response({"status": "received"})
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-            return web.json_response({"status": "error"}, status=400)
-    
+
+    async def _handle_ready(self, request):
+        """Readiness probe"""
+        if db._is_connected:
+            return web.json_response({"status": "ready"})
+        return web.json_response({"status": "not ready"}, status=503)
+
+    async def _handle_live(self, request):
+        """Liveness probe"""
+        return web.json_response({"status": "alive"})
+
     async def start(self):
         """Запуск веб-сервера"""
         self.runner = web.AppRunner(self.app)
@@ -853,8 +893,8 @@ class WebServer:
         port = int(os.environ.get("PORT", 10000))
         site = web.TCPSite(self.runner, "0.0.0.0", port)
         await site.start()
-        logger.info(f"🌐 Веб-сервер запущен на порту {port}")
-    
+        logger.info(f"🌐 Health-check сервер запущен на порту {port}")
+
     async def stop(self):
         """Остановка веб-сервера"""
         if self.runner:
@@ -864,36 +904,52 @@ class WebServer:
 
 web_server = WebServer()
 
-# ==================== ЗАПУСК ====================
+# ==================== ОБРАБОТКА СИГНАЛОВ ====================
+async def shutdown():
+    """Graceful shutdown"""
+    logger.info("🛑 Получен сигнал завершения, выполняем graceful shutdown...")
+    
+    await dp.stop_polling()
+    await web_server.stop()
+    await db.close()
+    await bot.session.close()
+    
+    logger.info("👋 Бот успешно остановлен")
+
+def signal_handler():
+    """Обработчик сигналов для graceful shutdown"""
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
+
+# ==================== ТОЧКА ВХОДА ====================
 async def main():
     """Главная функция запуска"""
     try:
         logger.info("🚀 Запуск бота...")
+        logger.info(f"📢 Получатели уведомлений: {ADMIN_IDS}")
         
-        # Инициализация базы данных
-        await db.init_db()
-        logger.info("📊 База данных готова")
+        signal_handler()
         
-        # Запуск веб-сервера
+        await db.connect()
         await web_server.start()
+        await bot.delete_webhook(drop_pending_updates=True)
         
-        # Запуск поллинга
         logger.info("🤖 Бот готов к работе!")
         await dp.start_polling(bot)
         
+    except asyncio.CancelledError:
+        logger.info("⚠️ Задача была отменена")
     except KeyboardInterrupt:
         logger.info("⚠️ Получен сигнал остановки (Ctrl+C)")
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
+        logger.critical(f"❌ Критическая ошибка: {e}", exc_info=True)
         raise
     finally:
-        # Корректное завершение
-        await web_server.stop()
-        await bot.session.close()
-        logger.info("👋 Бот остановлен")
+        await shutdown()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот завершен пользователем")
+        logger.info("Программа завершена пользователем")
