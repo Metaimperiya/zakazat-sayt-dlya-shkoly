@@ -8,20 +8,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Токен бота и твой ID в Telegram
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Твой ID, куда будут прилетать заявки
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Состояния для формы заявки
 class OrderForm(StatesGroup):
     service = State()
     name = State()
     contact = State()
 
-# Главное меню
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎓 Выпускной альбом / Класс")],
@@ -42,15 +39,13 @@ async def start_cmd(message: Message):
         reply_markup=main_keyboard
     )
 
-# Обработчики кнопок услуг
 @dp.message(F.text == "🎓 Выпускной альбом / Класс")
 async def service1(message: Message):
     await message.answer(
         "🎓 **Интерактивный сайт для выпускников**\n\n"
         "• Онлайн-альбом с фото и видео\n"
         "• Страница каждого ученика\n"
-        "• Таймер до выпускного\n"
-        "• Память на всю жизнь!\n\n"
+        "• Таймер до выпускного\n\n"
         "💰 **Цена:** от 3 000 грн / 8 000 руб.\n\n"
         "Жми «📞 Связаться / Оставить заявку» для заказа!"
     )
@@ -60,8 +55,7 @@ async def service2(message: Message):
     await message.answer(
         "🎒 **Уютный сайт для начальных классов**\n\n"
         "• Расписание и объявления\n"
-        "• Фотоотчеты с мероприятий\n"
-        "• Удобная связь с родкомом и учителем\n\n"
+        "• Фотоотчеты с мероприятий\n\n"
         "💰 **Цена:** от 2 500 грн / 6 500 руб."
     )
 
@@ -70,8 +64,7 @@ async def service3(message: Message):
     await message.answer(
         "🏫 **Официальный веб-сайт школы / лицея**\n\n"
         "• Соответствие нормам и стандартам\n"
-        "• Разделы: Документы, Педсостав, Новости\n"
-        "• Адаптив под мобилки\n\n"
+        "• Разделы: Документы, Педсостав, Новости\n\n"
         "💰 **Цена:** от 8 000 грн / 20 000 руб."
     )
 
@@ -84,7 +77,6 @@ async def service4(message: Message):
         "💰 **Цена:** от 1 500 грн / 4 000 руб."
     )
 
-# Сценарий формы заявки
 @dp.message(F.text == "📞 Связаться / Оставить заявку")
 async def start_order(message: Message, state: FSMContext):
     await state.set_state(OrderForm.service)
@@ -110,7 +102,6 @@ async def process_contact(message: Message, state: FSMContext):
     user_data = await state.get_data()
     contact = message.text
     
-    # Текст заявки для админа
     text_to_admin = (
         "📥 **НОВАЯ ЗАЯВКА!**\n\n"
         f"👤 **Имя:** {user_data['name']}\n"
@@ -119,7 +110,6 @@ async def process_contact(message: Message, state: FSMContext):
         f"🔗 **Юзер:** @{message.from_user.username or 'нет_юзернейма'}"
     )
 
-    # Отправляем тебе в ЛС (если указан ADMIN_ID)
     if ADMIN_ID:
         try:
             await bot.send_message(chat_id=ADMIN_ID, text=text_to_admin)
@@ -132,22 +122,24 @@ async def process_contact(message: Message, state: FSMContext):
     )
     await state.clear()
 
-# Веб-сервер для удержания Render в бодрствовании (Keep-Alive)
+# Микро веб-сервер (исправлен ответ и динамический порт Render)
 async def handle_ping(request):
-    return web.Response(text="Bot is alive!")
+    return web.Response(text="OK", status=200)
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+    
+    # Render передает свой порт в переменную PORT
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
 async def main():
     await start_web_server()
-    print("Веб-сервер и бот запущены!")
+    print("Веб-сервер запущен, начинаем polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
